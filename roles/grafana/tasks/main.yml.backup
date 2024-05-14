@@ -1,0 +1,143 @@
+---
+# tasks file for Grafana
+
+- name: Install Network Tools
+  yum:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - wget
+    - net-tools
+    - curl
+
+- name: Create User Grafana
+  user:
+    name: grafana
+    create_home: no
+    shell: /bin/false
+
+- name: Create directories for Grafana
+  file:
+    path: '{{ item }}'
+    state: directory
+    owner: grafana
+    group: grafana
+  loop:
+    - /tmp/grafana
+    - /etc/grafana/provisioning/dashboards
+    - /etc/grafana/provisioning/datasources
+
+- name: Download Grafana deb
+  get_url:
+    url: 'https://dl.grafana.com/oss/release/grafana_{{ grafana_version }}_amd64.deb'
+    dest: '/tmp/grafana.deb'
+  when: ansible_os_family == "Debian"
+
+- name: Install Grafana (Debian)
+  apt:
+    deb: '/tmp/grafana.deb'
+  when: ansible_os_family == "Debian"
+
+- name: Download Grafana rpm
+  get_url:
+    url: 'https://dl.grafana.com/oss/release/grafana-{{ grafana_version }}-1.x86_64.rpm'
+    dest: '/tmp/grafana.rpm'
+  when: ansible_os_family == "RedHat"
+
+- name: Import Grafana GPG Key
+  shell:
+    cmd: wget -q -O /tmp/gpg.key https://rpm.grafana.com/gpg.key && sudo rpm --import /tmp/gpg.key
+  become: yes
+
+- name: Create Grafana repo file
+  copy:
+    dest: /etc/yum.repos.d/grafana.repo
+    content: |
+      [grafana]
+      name=grafana
+      baseurl=https://rpm.grafana.com
+      repo_gpgcheck=1
+      enabled=1
+      gpgcheck=1
+      gpgkey=https://rpm.grafana.com/gpg.key
+      sslverify=1
+      sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+
+- name: Install Grafana (RedHat)
+  yum:
+    name: '/tmp/grafana.rpm'
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Dashboard setup config
+  template:
+    src: templates/dashboard.yml
+    dest: /etc/grafana/provisioning/dashboards/dashboard.yml
+
+- name: Datasources setup config
+  template:
+    src: templates/datasource.yml
+    dest: /etc/grafana/provisioning/datasources/datasource.yml
+
+- name: Add dashboards dir
+  file:
+    path: /var/lib/grafana/dashboards
+    recurse: yes
+    state: directory
+
+- name: Reload systemd
+  command: systemctl daemon-reload
+
+- name: Enable and start Grafana service
+  systemd:
+    name: grafana-server
+    state: started
+    enabled: yes
+
+- name: (dashboard sync) Register previously copied dashboards
+  find:
+    paths: "/var/lib/grafana/dashboards"
+    hidden: true
+    patterns:
+        - "*.json"
+  register: _dashboards_present
+  when: grafana_provisioning_synced and grafana_provision_dashboards
+
+- name: Import grafana dashboards
+  copy:
+    src: "{{ item }}"
+    dest: "/var/lib/grafana/dashboards/{{ item | basename }}"
+  with_fileglob:
+    - "templates/*.json"
+  register: _dashboards_copied
+  when: grafana_provision_dashboards
+  notify:
+    - systemd reload
+
+- name: (dashboard sync) Get dashboard lists
+  set_fact:
+    _dashboards_present_list: "{{ _dashboards_present | json_query('files[*].path') | default([]) }}"
+    _dashboards_copied_list: "{{ _dashboards_copied | json_query('results[*].dest') | default([]) }}"
+  when: grafana_provisioning_synced and grafana_provision_dashboards
+
+- name: (dashboard sync) Remove dashbards not present on target machine
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items: "{{ _dashboards_present_list | difference( _dashboards_copied_list ) }}"
+  when: grafana_provisioning_synced and grafana_provision_dashboards
+  notify:
+    - systemd reload
+
+- name: Reload systemd
+  command: systemctl daemon-reload
+
+- name: Restart Grafana service
+  systemd:
+    name: grafana-server
+    state: restarted
+    enabled: yes
